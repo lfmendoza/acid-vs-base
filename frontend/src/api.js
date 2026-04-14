@@ -31,6 +31,8 @@ export const api = {
   acidTransferCrash: (from, to, amount) => post('/api/acid/transfer-with-crash', { from, to, amount }),
   acidBalances: () => get('/api/acid/balances'),
   acidConcurrentRead: (from, to, amount) => post('/api/acid/concurrent-read', { from, to, amount }),
+  acidLog: () => get('/api/acid/log'),
+  acidLogPush: (entries) => post('/api/acid/log', { entries }),
 
   // BASE
   baseTransfer: (from, to, amount) => post('/api/base/transfer', { from, to, amount }),

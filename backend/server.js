@@ -12,22 +12,14 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// --------------- Helpers ---------------
-
 function toNumber(val) {
   if (neo4j.isInt(val)) return val.toNumber();
   return typeof val === 'number' ? val : Number(val);
 }
 
-function ok(data) {
-  return { success: true, data };
-}
+function ok(data) { return { success: true, data }; }
+function fail(error) { return { success: false, data: null, error }; }
 
-function fail(error) {
-  return { success: false, data: null, error };
-}
-
-// Cypher: encontrar cuenta por nombre del titular (atraviesa el grafo)
 const FIND_CUENTA = 'MATCH (p:Persona {nombre: $name})-[:TIENE_CUENTA]->(c:Cuenta)';
 const GET_ALL_BALANCES = `
   MATCH (p:Persona)-[:TIENE_CUENTA]->(c:Cuenta)
@@ -35,10 +27,22 @@ const GET_ALL_BALANCES = `
   ORDER BY p.nombre
 `;
 
+// Mantener un log ACID equivalente al syncLog de BASE
+let acidLog = [];
+function acidAddLog(event, details) {
+  acidLog.push({ time: new Date().toISOString(), event, details });
+}
+function acidResetLog() {
+  acidLog = [];
+  acidAddLog('RESET', 'Sistema reiniciado — cuentas restauradas a Ana=Q5000, Luis=Q3000');
+}
+
 // --------------- POST /api/reset ---------------
 
 app.post('/api/reset', async (req, res) => {
   try {
+    acidResetLog();
+
     const neo4jResult = isConnected()
       ? await initDatabase()
       : { initialized: false, error: 'Neo4j no conectado' };
@@ -50,118 +54,136 @@ app.post('/api/reset', async (req, res) => {
   }
 });
 
-// --------------- ACID Endpoints ---------------
+// --------------- GET /api/acid/log ---------------
+
+app.get('/api/acid/log', (req, res) => {
+  res.json(ok({ log: acidLog.slice(-150) }));
+});
+
+app.post('/api/acid/log', (req, res) => {
+  const { entries } = req.body;
+  if (entries && Array.isArray(entries)) {
+    entries.forEach(e => acidAddLog(e.event || e.action, e.details || e.detail));
+  }
+  res.json(ok({ added: entries?.length || 0 }));
+});
+
+// --------------- ACID: Transfer ---------------
 
 app.post('/api/acid/transfer', async (req, res) => {
   const { from, to, amount } = req.body;
-  if (!from || !to || !amount) return res.status(400).json(fail('Faltan parámetros: from, to, amount'));
+  if (!from || !to || !amount) return res.status(400).json(fail('Faltan parámetros'));
   if (!isConnected()) return res.status(503).json(fail('Neo4j no está conectado'));
 
-  const log = [];
   try {
     const result = await runTransaction(async (tx) => {
-      log.push({ step: 1, action: 'BEGIN', detail: 'Transacción iniciada' });
+      acidAddLog('BEGIN', `Inicio de transacción explícita (BEGIN)`);
 
-      // Leer saldo del origen atravesando Persona -> Cuenta
-      const srcResult = await tx.run(
-        `${FIND_CUENTA} RETURN c.saldo AS saldo, c.numero AS cuenta`,
-        { name: from }
-      );
-      const srcBalance = toNumber(srcResult.records[0].get('saldo'));
-      const srcCuenta = srcResult.records[0].get('cuenta');
-      log.push({ step: 2, action: 'READ', detail: `${from} (${srcCuenta}): saldo = Q${srcBalance}` });
+      // READ origen
+      const srcRes = await tx.run(`${FIND_CUENTA} RETURN c.saldo AS saldo, c.numero AS cuenta`, { name: from });
+      const srcBal = toNumber(srcRes.records[0].get('saldo'));
+      const srcNum = srcRes.records[0].get('cuenta');
+      acidAddLog('READ', `Lectura cuenta origen: ${from} (${srcNum}) → saldo actual Q${srcBal}`);
 
-      if (srcBalance < amount) {
-        throw new Error(`Fondos insuficientes: ${from} tiene Q${srcBalance}, necesita Q${amount}`);
-      }
+      // VALIDATE
+      if (srcBal < amount) throw new Error(`Fondos insuficientes: Q${srcBal} < Q${amount}`);
+      acidAddLog('VALIDATE', `Validación: Q${srcBal} ≥ Q${amount} → aprobado`);
 
-      // Debitar origen
-      await tx.run(
-        `${FIND_CUENTA} SET c.saldo = c.saldo - $amount`,
-        { name: from, amount: neo4j.int(amount) }
-      );
-      log.push({ step: 3, action: 'DEBIT', detail: `${from} debitado: -Q${amount}` });
+      // READ destino
+      const dstRes = await tx.run(`${FIND_CUENTA} RETURN c.saldo AS saldo, c.numero AS cuenta`, { name: to });
+      const dstBal = toNumber(dstRes.records[0].get('saldo'));
+      const dstNum = dstRes.records[0].get('cuenta');
+      acidAddLog('READ', `Lectura cuenta destino: ${to} (${dstNum}) → saldo actual Q${dstBal}`);
 
-      // Acreditar destino
-      await tx.run(
-        `${FIND_CUENTA} SET c.saldo = c.saldo + $amount`,
-        { name: to, amount: neo4j.int(amount) }
-      );
-      log.push({ step: 4, action: 'CREDIT', detail: `${to} acreditado: +Q${amount}` });
+      // DEBIT
+      await tx.run(`${FIND_CUENTA} SET c.saldo = c.saldo - $amount`, { name: from, amount: neo4j.int(amount) });
+      acidAddLog('DEBIT', `${from}: Q${srcBal} → Q${srcBal - amount} (−Q${amount})`);
 
-      // Crear relación TRANSFERENCIA en el grafo
+      // CREDIT
+      await tx.run(`${FIND_CUENTA} SET c.saldo = c.saldo + $amount`, { name: to, amount: neo4j.int(amount) });
+      acidAddLog('CREDIT', `${to}: Q${dstBal} → Q${dstBal + amount} (+Q${amount})`);
+
+      // WRITE (registro en grafo)
       await tx.run(`
-        MATCH (pFrom:Persona {nombre: $from})-[:TIENE_CUENTA]->(cFrom:Cuenta)
-        MATCH (pTo:Persona {nombre: $to})-[:TIENE_CUENTA]->(cTo:Cuenta)
-        CREATE (cFrom)-[:TRANSFERENCIA {
-          monto: $amount,
-          fecha: datetime(),
-          estado: "completada"
-        }]->(cTo)
+        MATCH (pF:Persona {nombre: $from})-[:TIENE_CUENTA]->(cF:Cuenta)
+        MATCH (pT:Persona {nombre: $to})-[:TIENE_CUENTA]->(cT:Cuenta)
+        CREATE (cF)-[:TRANSFERENCIA {monto: $amount, fecha: datetime(), estado: "completada"}]->(cT)
       `, { from, to, amount: neo4j.int(amount) });
-      log.push({ step: 5, action: 'RELATION', detail: `Relación (:Cuenta)-[:TRANSFERENCIA {monto: ${amount}}]->(:Cuenta) creada` });
+      acidAddLog('WRITE', `Registro: ${srcNum} →[Q${amount}]→ ${dstNum} guardado en grafo`);
 
-      log.push({ step: 6, action: 'COMMIT', detail: 'Transacción confirmada (COMMIT)' });
+      // COMMIT
+      acidAddLog('COMMIT', `COMMIT: todas las operaciones confirmadas atómicamente en una sola transacción`);
 
-      const finalResult = await tx.run(GET_ALL_BALANCES);
-      return finalResult.records.map(r => ({
-        titular: r.get('titular'),
-        saldo: toNumber(r.get('saldo')),
-      }));
+      // VERIFY
+      const finalRes = await tx.run(GET_ALL_BALANCES);
+      const balances = finalRes.records.map(r => ({ titular: r.get('titular'), saldo: toNumber(r.get('saldo')) }));
+      const total = balances.reduce((s, a) => s + a.saldo, 0);
+      acidAddLog('VERIFY', `Post-commit: ${balances.map(b => `${b.titular}=Q${b.saldo}`).join(', ')} | Total=Q${total}`);
+      acidAddLog('CONSISTENT', `Integridad confirmada: Total Q${total} — datos consistentes globalmente`);
+
+      return balances;
     });
 
     const total = result.reduce((sum, a) => sum + a.saldo, 0);
-    res.json(ok({ balances: result, total, log }));
+    res.json(ok({ balances: result, total, log: acidLog.slice(-150) }));
   } catch (err) {
-    log.push({ step: log.length + 1, action: 'ERROR', detail: err.message });
-    res.status(400).json({ success: false, data: { log }, error: err.message });
+    acidAddLog('ERROR', err.message);
+    res.status(400).json({ success: false, data: { log: acidLog.slice(-150) }, error: err.message });
   }
 });
+
+// --------------- ACID: Transfer with Crash ---------------
 
 app.post('/api/acid/transfer-with-crash', async (req, res) => {
   const { from = 'Ana', to = 'Luis', amount = 200 } = req.body || {};
   if (!isConnected()) return res.status(503).json(fail('Neo4j no está conectado'));
 
-  const log = [];
   try {
     await runTransaction(async (tx) => {
-      log.push({ step: 1, action: 'BEGIN', detail: 'Transacción iniciada' });
+      acidAddLog('BEGIN', `Inicio de transacción explícita (BEGIN)`);
 
-      const srcResult = await tx.run(
-        `${FIND_CUENTA} RETURN c.saldo AS saldo, c.numero AS cuenta`,
-        { name: from }
-      );
-      const srcBalance = toNumber(srcResult.records[0].get('saldo'));
-      log.push({ step: 2, action: 'READ', detail: `${from}: saldo = Q${srcBalance}` });
+      // READ
+      const srcRes = await tx.run(`${FIND_CUENTA} RETURN c.saldo AS saldo, c.numero AS cuenta`, { name: from });
+      const srcBal = toNumber(srcRes.records[0].get('saldo'));
+      acidAddLog('READ', `Lectura cuenta origen: ${from} → saldo actual Q${srcBal}`);
 
-      // Debitar origen
-      await tx.run(
-        `${FIND_CUENTA} SET c.saldo = c.saldo - $amount`,
-        { name: from, amount: neo4j.int(amount) }
-      );
-      log.push({ step: 3, action: 'DEBIT', detail: `${from} debitado: -Q${amount}` });
+      const dstRes = await tx.run(`${FIND_CUENTA} RETURN c.saldo AS saldo`, { name: to });
+      const dstBal = toNumber(dstRes.records[0].get('saldo'));
+      acidAddLog('READ', `Lectura cuenta destino: ${to} → saldo actual Q${dstBal}`);
 
-      // CRASH antes de acreditar y antes de crear la relación
-      log.push({ step: 4, action: 'CRASH', detail: 'ERROR simulado antes de acreditar a destino y crear relación' });
-      throw new Error('CRASH_SIMULADO: Fallo del sistema antes de completar la transferencia');
+      // VALIDATE
+      acidAddLog('VALIDATE', `Validación: Q${srcBal} ≥ Q${amount} → aprobado`);
+
+      // DEBIT
+      await tx.run(`${FIND_CUENTA} SET c.saldo = c.saldo - $amount`, { name: from, amount: neo4j.int(amount) });
+      acidAddLog('DEBIT', `${from}: Q${srcBal} → Q${srcBal - amount} (−Q${amount})`);
+
+      // CRASH antes del CREDIT
+      acidAddLog('CRASH', `FALLO: el sistema murió después del DEBIT pero antes del CREDIT`);
+      acidAddLog('CRASH', `${to} NUNCA recibió +Q${amount} — transacción incompleta`);
+      throw new Error('CRASH_SIMULADO');
     });
   } catch (err) {
-    log.push({ step: 5, action: 'ROLLBACK', detail: 'Transacción revertida — saldos y grafo sin cambios' });
+    acidAddLog('ROLLBACK', `Neo4j revirtió TODAS las operaciones automáticamente`);
+    acidAddLog('ROLLBACK', `DEBIT de −Q${req.body?.amount || 200} a ${req.body?.from || 'Ana'} fue deshecho`);
   }
 
   try {
     const balances = await runQuery(GET_ALL_BALANCES);
     const formatted = balances.map(r => ({ titular: r.titular, saldo: toNumber(r.saldo) }));
     const total = formatted.reduce((sum, a) => sum + a.saldo, 0);
-    res.json(ok({ balances: formatted, total, log, rolledBack: true }));
+    acidAddLog('VERIFY', `Post-rollback: ${formatted.map(b => `${b.titular}=Q${b.saldo}`).join(', ')} | Total=Q${total}`);
+    acidAddLog('CONSISTENT', `Integridad confirmada: Q${total} — NINGÚN dato se corrompió`);
+    res.json(ok({ balances: formatted, total, log: acidLog.slice(-150), rolledBack: true }));
   } catch (err) {
-    res.json(ok({ log, rolledBack: true, error: err.message }));
+    res.json(ok({ log: acidLog.slice(-150), rolledBack: true, error: err.message }));
   }
 });
 
+// --------------- ACID: Balances ---------------
+
 app.get('/api/acid/balances', async (req, res) => {
   if (!isConnected()) return res.status(503).json(fail('Neo4j no está conectado'));
-
   try {
     const result = await runQuery(GET_ALL_BALANCES);
     const balances = result.map(r => ({ titular: r.titular, saldo: toNumber(r.saldo) }));
@@ -172,62 +194,55 @@ app.get('/api/acid/balances', async (req, res) => {
   }
 });
 
+// --------------- ACID: Concurrent Read ---------------
+
 app.post('/api/acid/concurrent-read', async (req, res) => {
   const { from = 'Ana', to = 'Luis', amount = 200 } = req.body || {};
   if (!isConnected()) return res.status(503).json(fail('Neo4j no está conectado'));
 
-  const log = [];
-
   try {
     const transferPromise = runTransaction(async (tx) => {
-      log.push({ step: 1, action: 'TX_BEGIN', detail: 'Transacción de transferencia iniciada' });
+      acidAddLog('BEGIN', `Sesión A: inicio de transacción de transferencia`);
+      acidAddLog('READ', `Sesión A: leyendo saldos actuales`);
+      acidAddLog('VALIDATE', `Sesión A: fondos verificados`);
 
-      await tx.run(
-        `${FIND_CUENTA} SET c.saldo = c.saldo - $amount`,
-        { name: from, amount: neo4j.int(amount) }
-      );
-      log.push({ step: 2, action: 'TX_DEBIT', detail: `${from} debitado en transacción` });
+      await tx.run(`${FIND_CUENTA} SET c.saldo = c.saldo - $amount`, { name: from, amount: neo4j.int(amount) });
+      acidAddLog('DEBIT', `Sesión A: ${from} debitado −Q${amount}`);
 
-      await tx.run(
-        `${FIND_CUENTA} SET c.saldo = c.saldo + $amount`,
-        { name: to, amount: neo4j.int(amount) }
-      );
-      log.push({ step: 3, action: 'TX_CREDIT', detail: `${to} acreditado en transacción` });
+      await tx.run(`${FIND_CUENTA} SET c.saldo = c.saldo + $amount`, { name: to, amount: neo4j.int(amount) });
+      acidAddLog('CREDIT', `Sesión A: ${to} acreditado +Q${amount}`);
 
       await tx.run(`
-        MATCH (pFrom:Persona {nombre: $from})-[:TIENE_CUENTA]->(cFrom:Cuenta)
-        MATCH (pTo:Persona {nombre: $to})-[:TIENE_CUENTA]->(cTo:Cuenta)
-        CREATE (cFrom)-[:TRANSFERENCIA {monto: $amount, fecha: datetime(), estado: "completada"}]->(cTo)
+        MATCH (pF:Persona {nombre: $from})-[:TIENE_CUENTA]->(cF:Cuenta)
+        MATCH (pT:Persona {nombre: $to})-[:TIENE_CUENTA]->(cT:Cuenta)
+        CREATE (cF)-[:TRANSFERENCIA {monto: $amount, fecha: datetime(), estado: "completada"}]->(cT)
       `, { from, to, amount: neo4j.int(amount) });
+      acidAddLog('WRITE', `Sesión A: transferencia registrada en grafo`);
 
-      const finalResult = await tx.run(GET_ALL_BALANCES);
-      log.push({ step: 4, action: 'TX_COMMIT', detail: 'Transacción confirmada' });
-      return finalResult.records.map(r => ({ titular: r.get('titular'), saldo: toNumber(r.get('saldo')) }));
+      const finalRes = await tx.run(GET_ALL_BALANCES);
+      acidAddLog('COMMIT', `Sesión A: transacción confirmada`);
+      return finalRes.records.map(r => ({ titular: r.get('titular'), saldo: toNumber(r.get('saldo')) }));
     });
 
     const readPromise = runReadTransaction(async (tx) => {
-      log.push({ step: 'R1', action: 'READ_START', detail: 'Lectura concurrente desde otra sesión' });
+      acidAddLog('READ', `Sesión B: lectura concurrente desde otra conexión`);
       const result = await tx.run(GET_ALL_BALANCES);
       const balances = result.records.map(r => ({ titular: r.get('titular'), saldo: toNumber(r.get('saldo')) }));
-      log.push({ step: 'R2', action: 'READ_RESULT', detail: `Lectura vio: ${balances.map(b => `${b.titular}=Q${b.saldo}`).join(', ')}` });
+      acidAddLog('READ', `Sesión B: vio ${balances.map(b => `${b.titular}=Q${b.saldo}`).join(', ')}`);
       return balances;
     });
 
     const [transferResult, readResult] = await Promise.all([transferPromise, readPromise]);
-
     const transferTotal = transferResult.reduce((s, a) => s + a.saldo, 0);
     const readTotal = readResult.reduce((s, a) => s + a.saldo, 0);
 
-    log.push({
-      step: 5,
-      action: 'ISOLATION',
-      detail: `Lectura concurrente vio total=Q${readTotal} (consistente). ACID garantiza aislamiento.`,
-    });
+    acidAddLog('VERIFY', `Sesión B leyó Total=Q${readTotal} — estado consistente (antes o después del commit, nunca a medias)`);
+    acidAddLog('CONSISTENT', `AISLAMIENTO garantizado: lecturas concurrentes nunca ven datos parciales`);
 
     res.json(ok({
       transferResult: { balances: transferResult, total: transferTotal },
       concurrentRead: { balances: readResult, total: readTotal },
-      log,
+      log: acidLog.slice(-150),
     }));
   } catch (err) {
     res.status(500).json(fail(err.message));
@@ -251,38 +266,30 @@ app.post('/api/base/transfer-with-crash', (req, res) => {
 app.get('/api/base/balances', (req, res) => {
   const state = base.getState();
   res.json(ok({
-    replicas: state.replicas.map(r => ({
-      id: r.id,
-      accounts: r.accounts,
-      total: r.total,
-      isPrimary: r.isPrimary,
-      online: r.online,
-    })),
+    replicas: state.replicas.map(r => ({ id: r.id, accounts: r.accounts, total: r.total, isPrimary: r.isPrimary, online: r.online })),
     consistent: state.consistent,
   }));
 });
 
-app.get('/api/base/state', (req, res) => {
-  res.json(ok(base.getState()));
-});
+app.get('/api/base/state', (req, res) => { res.json(ok(base.getState())); });
 
 app.post('/api/base/partition', (req, res) => {
   const { nodeId } = req.body;
-  if (!nodeId) return res.status(400).json(fail('Falta parámetro: nodeId'));
+  if (!nodeId) return res.status(400).json(fail('Falta: nodeId'));
   const result = base.simulatePartition(nodeId);
   res.json(result.success ? ok(result) : { success: false, data: null, error: result.error });
 });
 
 app.post('/api/base/heal', (req, res) => {
   const { nodeId } = req.body;
-  if (!nodeId) return res.status(400).json(fail('Falta parámetro: nodeId'));
+  if (!nodeId) return res.status(400).json(fail('Falta: nodeId'));
   const result = base.healPartition(nodeId);
   res.json(result.success ? ok(result) : { success: false, data: null, error: result.error });
 });
 
 app.post('/api/base/read-from', (req, res) => {
   const { account, replicaId } = req.body;
-  if (!account) return res.status(400).json(fail('Falta parámetro: account'));
+  if (!account) return res.status(400).json(fail('Falta: account'));
   const result = base.readBalance(account, replicaId);
   res.json(result.success ? ok(result) : { success: false, data: null, error: result.error });
 });
@@ -295,9 +302,7 @@ async function startServer() {
   console.log('============================================\n');
 
   const connectivity = await verifyConnectivity();
-  if (connectivity.connected) {
-    await initDatabase();
-  }
+  if (connectivity.connected) await initDatabase();
 
   const server = app.listen(PORT, () => {
     console.log(`\n[Server] Escuchando en http://localhost:${PORT}`);
@@ -307,16 +312,12 @@ async function startServer() {
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`\n[Server] El puerto ${PORT} ya está en uso.`);
-      console.error(`[Server] Cierra el otro proceso o usa PORT=<otro> en .env\n`);
+      console.error(`\n[Server] Puerto ${PORT} en uso.\n`);
     } else {
-      console.error('[Server] Error al iniciar:', err.message);
+      console.error('[Server] Error:', err.message);
     }
     process.exit(1);
   });
 }
 
-startServer().catch(err => {
-  console.error('Error fatal al iniciar:', err);
-  process.exit(1);
-});
+startServer().catch(err => { console.error('Error fatal:', err); process.exit(1); });

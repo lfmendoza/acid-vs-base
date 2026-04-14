@@ -2,11 +2,21 @@ import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const actionColors = {
+  // Flujo transaccional (simétrico ACID ↔ BASE)
   BEGIN: 'text-teal-400',
+  REQUEST: 'text-slate-300',
+  ROUTING: 'text-slate-400',
   READ: 'text-blue-400',
+  VALIDATE: 'text-blue-300',
   DEBIT: 'text-amber-400',
   CREDIT: 'text-emerald-400',
+  WRITE: 'text-purple-400',
+  ACK: 'text-amber-300',
   COMMIT: 'text-emerald-300',
+  VERIFY: 'text-cyan-400',
+  CONSISTENT: 'text-emerald-300',
+
+  // ACID específico
   TX_BEGIN: 'text-teal-400',
   TX_DEBIT: 'text-amber-400',
   TX_CREDIT: 'text-emerald-400',
@@ -15,55 +25,49 @@ const actionColors = {
   READ_RESULT: 'text-blue-300',
   ISOLATION: 'text-teal-300',
   ROLLBACK: 'text-red-400',
+
+  // Errores / crash
   CRASH: 'text-red-500',
-  CRASH_DETAIL: 'text-red-400',
   ERROR: 'text-red-400',
-  WRITE: 'text-amber-400',
-  WRITE_PRIMARY: 'text-amber-400',
-  ACK_PRIMARY: 'text-amber-300',
-  REQUEST: 'text-slate-300',
-  ROUTING: 'text-slate-400',
-  VALIDATION: 'text-blue-300',
-  VALIDATION_FAIL: 'text-red-400',
-  REPLICA_STATE: 'text-slate-400',
-  PROPAGATION_START: 'text-amber-300',
-  PROPAGATION_QUEUE: 'text-amber-200',
-  SYNC_START: 'text-cyan-400',
-  SYNC_APPLY: 'text-cyan-300',
-  SYNC_DONE: 'text-emerald-400',
+  VALIDATE_FAIL: 'text-red-400',
+
+  // BASE propagación
+  PROPAGATION: 'text-amber-300',
+  STALE: 'text-orange-400',
   SYNC: 'text-emerald-400',
   SYNC_FAILED: 'text-red-400',
-  STALE_NODE: 'text-red-300',
-  STALE_WARNING: 'text-orange-400',
-  INCONSISTENCY: 'text-red-400',
-  TOTAL_MISMATCH: 'text-red-300',
   STALE_READ: 'text-orange-400',
   READ_ROUTING: 'text-slate-400',
-  READ_FAIL: 'text-red-400',
+  INCONSISTENT: 'text-red-400',
+  CONVERGED: 'text-emerald-300',
+
+  // Partición
   NETWORK: 'text-yellow-400',
   TOPOLOGY: 'text-slate-400',
+  AVAILABILITY: 'text-amber-300',
   PARTITION: 'text-red-400',
   HEAL: 'text-emerald-400',
+
+  // Recovery
   RECOVERY: 'text-cyan-300',
   ANTI_ENTROPY: 'text-cyan-400',
-  RELATION: 'text-purple-400',
-  EVENTUAL_SYNC: 'text-emerald-300',
+
+  // Otros
   RESET: 'text-slate-500',
   INFO: 'text-slate-400',
 };
 
 const actionIcons = {
-  BEGIN: '▶',  COMMIT: '✓',  ROLLBACK: '↩',  CRASH: '💥',  CRASH_DETAIL: '💥',
-  ERROR: '✗',  READ: '📖',  DEBIT: '−',  CREDIT: '+',
-  REQUEST: '→',  ROUTING: '⤷',  VALIDATION: '✓',  VALIDATION_FAIL: '✗',
-  WRITE_PRIMARY: '✎',  ACK_PRIMARY: '✓',  REPLICA_STATE: '◉',
-  PROPAGATION_START: '📡',  PROPAGATION_QUEUE: '⏳',
-  SYNC_START: '↓',  SYNC_APPLY: '⇄',  SYNC_DONE: '✓',  SYNC: '✓',  SYNC_FAILED: '✗',
-  STALE_NODE: '⚠',  STALE_WARNING: '⚠',  STALE_READ: '👁',
-  INCONSISTENCY: '≠',  TOTAL_MISMATCH: '≠',
-  NETWORK: '🌐',  TOPOLOGY: '◎',  PARTITION: '✂',  HEAL: '🔗',
-  RECOVERY: '🔄',  ANTI_ENTROPY: '🔄',  EVENTUAL_SYNC: '✓',
-  READ_ROUTING: '⤷',  RELATION: '🔗',  RESET: '↻',  INFO: 'ℹ',
+  BEGIN: '▶', REQUEST: '→', ROUTING: '⤷', READ: '📖',
+  VALIDATE: '✓', DEBIT: '−', CREDIT: '+', WRITE: '✎',
+  ACK: '✓', COMMIT: '✓✓', VERIFY: '🔍', CONSISTENT: '✅',
+  TX_BEGIN: '▶', TX_DEBIT: '−', TX_CREDIT: '+', TX_COMMIT: '✓✓',
+  READ_START: '📖', READ_RESULT: '📖', ISOLATION: '🔒',
+  ROLLBACK: '↩', CRASH: '💥', ERROR: '✗', VALIDATE_FAIL: '✗',
+  PROPAGATION: '📡', STALE: '⚠', SYNC: '⇄', SYNC_FAILED: '✗',
+  STALE_READ: '👁', READ_ROUTING: '⤷', INCONSISTENT: '≠', CONVERGED: '✅',
+  NETWORK: '🌐', TOPOLOGY: '◎', AVAILABILITY: '✓', PARTITION: '✂', HEAL: '🔗',
+  RECOVERY: '🔄', ANTI_ENTROPY: '🔄', RESET: '↻', INFO: 'ℹ',
 };
 
 function LogColumn({ title, entries, accent }) {
@@ -83,7 +87,7 @@ function LogColumn({ title, entries, accent }) {
           <span className="text-slate-600 font-normal normal-case text-xs">{entries.length}</span>
         )}
       </div>
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-2 space-y-1">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-2 space-y-0.5">
         <AnimatePresence>
           {entries.map((entry, i) => {
             const color = actionColors[entry.action] || 'text-slate-400';
@@ -91,16 +95,16 @@ function LogColumn({ title, entries, accent }) {
             return (
               <motion.div
                 key={`${entry.time}-${i}`}
-                initial={{ opacity: 0, x: -8 }}
+                initial={{ opacity: 0, x: -6 }}
                 animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.12 }}
-                className="flex gap-2.5 text-[13px] leading-relaxed py-0.5"
+                transition={{ duration: 0.1 }}
+                className="flex gap-2 text-[13px] leading-relaxed py-0.5"
               >
                 <span className="text-slate-600 flex-shrink-0 tabular-nums w-[70px]">
                   {entry.time ? new Date(entry.time).toLocaleTimeString() : ''}
                 </span>
                 <span className={`flex-shrink-0 w-5 text-center ${color}`}>{icon}</span>
-                <span className={`font-mono font-bold flex-shrink-0 ${color} min-w-[120px]`}>
+                <span className={`font-mono font-bold flex-shrink-0 ${color}`} style={{ minWidth: '110px' }}>
                   {entry.action}
                 </span>
                 <span className="text-slate-300 break-words">{entry.detail}</span>

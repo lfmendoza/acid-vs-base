@@ -8,18 +8,6 @@ export default function App() {
   const [baseLog, setBaseLog] = useState([]);
   const [resetting, setResetting] = useState(false);
 
-  const addAcidLog = useCallback((entries) => {
-    setAcidLog((prev) => [
-      ...prev,
-      ...entries.map(e => ({ ...e, time: e.time || new Date().toISOString() })),
-    ]);
-  }, []);
-
-  // Replace BASE logs entirely from backend syncLog
-  const setBaseLogFromSync = useCallback((entries) => {
-    setBaseLog(entries);
-  }, []);
-
   const handleReset = async () => {
     setResetting(true);
     await api.reset();
@@ -52,7 +40,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 min-h-0 overflow-hidden">
-        <SplitView addAcidLog={addAcidLog} setBaseLogFromSync={setBaseLogFromSync} />
+        <SplitView setAcidLog={setAcidLog} setBaseLog={setBaseLog} />
       </main>
 
       <TransactionLog acidLog={acidLog} baseLog={baseLog} />
