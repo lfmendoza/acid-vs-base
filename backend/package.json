@@ -1,0 +1,16 @@
+{
+  "name": "acid-vs-base-backend",
+  "version": "1.0.0",
+  "description": "Backend para demo interactiva ACID vs BASE con Neo4j",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "neo4j-driver": "^5.27.0"
+  }
+}
