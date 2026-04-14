@@ -1,35 +1,73 @@
 import { motion } from 'framer-motion';
 
-const statusColors = {
-  consistent: 'border-emerald-400 shadow-emerald-400/20',
-  propagating: 'border-amber-400 shadow-amber-400/20',
-  inconsistent: 'border-red-400 shadow-red-400/20',
-  offline: 'border-slate-600 shadow-none opacity-50',
-  default: 'border-slate-600 shadow-none',
+const statusStyles = {
+  consistent: {
+    border: 'border-emerald-400',
+    shadow: 'shadow-emerald-400/30',
+    bg: 'bg-emerald-950/40',
+    glow: true,
+  },
+  propagating: {
+    border: 'border-amber-400',
+    shadow: 'shadow-amber-400/30',
+    bg: 'bg-amber-950/40',
+    glow: true,
+  },
+  inconsistent: {
+    border: 'border-red-400',
+    shadow: 'shadow-red-400/30',
+    bg: 'bg-red-950/40',
+    glow: true,
+  },
+  offline: {
+    border: 'border-slate-700',
+    shadow: 'shadow-none',
+    bg: 'bg-slate-900/60',
+    glow: false,
+  },
+  default: {
+    border: 'border-slate-600',
+    shadow: 'shadow-none',
+    bg: 'bg-slate-800/60',
+    glow: false,
+  },
 };
 
 export default function AccountNode({ name, balance, status = 'default', size = 'normal' }) {
-  const colorClass = statusColors[status] || statusColors.default;
-  const sizeClass = size === 'small' ? 'w-20 h-20 text-xs' : 'w-28 h-28 text-sm';
+  const style = statusStyles[status] || statusStyles.default;
+  const isSmall = size === 'small';
 
   return (
     <motion.div
       layout
       className={`
-        ${sizeClass} rounded-full border-3 flex flex-col items-center justify-center
-        bg-slate-800/60 backdrop-blur shadow-lg ${colorClass} transition-colors duration-300
+        ${isSmall ? 'w-[72px] h-[72px]' : 'w-32 h-32'}
+        rounded-full border-[3px] flex flex-col items-center justify-center
+        ${style.bg} ${style.border} ${style.shadow}
+        backdrop-blur-sm transition-colors duration-500
+        ${style.glow ? 'shadow-lg' : ''}
       `}
+      animate={status === 'propagating' ? { borderColor: ['#fbbf24', '#f59e0b', '#fbbf24'] } : {}}
+      transition={status === 'propagating' ? { repeat: Infinity, duration: 1.5 } : {}}
     >
-      <span className="font-semibold text-slate-300">{name}</span>
-      <motion.span
-        key={balance}
-        initial={{ scale: 1.3, color: '#facc15' }}
-        animate={{ scale: 1, color: '#ffffff' }}
-        transition={{ duration: 0.4 }}
-        className="text-lg font-bold"
-      >
-        Q{balance ?? '—'}
-      </motion.span>
+      <span className={`font-semibold text-slate-300 ${isSmall ? 'text-[10px]' : 'text-xs'}`}>
+        {name}
+      </span>
+      <AnimatedBalance balance={balance} isSmall={isSmall} />
     </motion.div>
+  );
+}
+
+function AnimatedBalance({ balance, isSmall }) {
+  return (
+    <motion.span
+      key={balance}
+      initial={{ scale: 1.4, color: '#facc15' }}
+      animate={{ scale: 1, color: '#ffffff' }}
+      transition={{ duration: 0.5, ease: 'easeOut' }}
+      className={`font-black tabular-nums ${isSmall ? 'text-sm' : 'text-xl'}`}
+    >
+      Q{balance ?? '—'}
+    </motion.span>
   );
 }
